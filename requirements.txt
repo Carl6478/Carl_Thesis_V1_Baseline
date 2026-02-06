@@ -1,7 +1,7 @@
 streamlit
 pandas
 numpy
-supabase-py
+supabase
 human-eval
 radon
 cognitive-complexity
