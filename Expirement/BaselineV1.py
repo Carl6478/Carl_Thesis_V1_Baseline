@@ -626,18 +626,34 @@ def analyze_code_metrics(code: str, metrics_to_compute=None):
 # ---------------------------------------------------------
 #  Batch Processing
 # ---------------------------------------------------------
-def run_batch_evaluation(models, task_ids, problems, compute_metrics=True, metrics_to_compute=None, progress_bar=None, status_text=None):
+def run_batch_evaluation(
+    models,
+    task_ids,
+    problems,
+    compute_metrics=True,
+    metrics_to_compute=None,
+    attempts_per_task=2,
+    progress_bar=None,
+    status_text=None,
+):
     """
-    Run batch evaluation: for each (model, task_id), generate 2 attempts and evaluate.
+    Run batch evaluation: for each (model, task_id), generate N attempts and evaluate.
     Returns list of aggregated rows for CSV.
     """
     # Create readable timestamp for run_id and filenames
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     run_id = f"batch_{timestamp}"
     rows = []
+
+    # Safety: clamp attempts to a sensible range (1–10)
+    if attempts_per_task < 1:
+        attempts_per_task = 1
+    if attempts_per_task > 10:
+        attempts_per_task = 10
+
     total_jobs = len(models) * len(task_ids)
     current_job = 0
-   
+
     for model in models:
         for task_id in task_ids:
             current_job += 1
@@ -645,304 +661,170 @@ def run_batch_evaluation(models, task_ids, problems, compute_metrics=True, metri
                 progress_bar.progress(current_job / total_jobs)
             if status_text:
                 status_text.text(f"Processing: {model} × {task_id} ({current_job}/{total_jobs})")
-           
+
             task = problems.get(task_id)
             if not task:
                 continue
-           
+
             prompt = task.get("prompt", "")
             if not prompt:
                 continue
-           
-            # Initialize attempt data
-            attempt1_passed = None
-            attempt2_passed = None
-            attempt1_eval = None
-            attempt2_eval = None
-            attempt1_metrics = {}
-            attempt2_metrics = {}
-            attempt1_output = ""
-            attempt1_code = ""
-            attempt2_output = ""
-            attempt2_code = ""
-           
-            # Attempt 1
-            try:
-                attempt1_output = run_ollama(model, prompt)
-                attempt1_code = extract_python_code(attempt1_output)
-                if not attempt1_code.strip() and attempt1_output.strip():
-                    attempt1_code = attempt1_output.strip()
-               
-                # Evaluate attempt 1
-                completion1 = None
-                eval_skipped_reason = None
-                if not human_eval_exec:
-                    eval_skipped_reason = "human_eval_exec is None"
-                elif not attempt1_code.strip():
-                    eval_skipped_reason = "attempt1_code is empty"
-               
-                if human_eval_exec and attempt1_code.strip():
-                    try:
-                        # Normalize completion (HumanEval expects completion, not redefined def)
-                        completion1 = normalize_humaneval_completion(prompt, attempt1_code)
-                        # Use Windows-safe multiprocessing-based timeout wrapper (no signals)
-                        r = check_correctness_windows(task, completion1, timeout_s=30.0)
-                        attempt1_eval = r
-                        # Debug: Log completion and result (for troubleshooting)
-                        if isinstance(r, dict) and "result" in r:
-                            pass  # Result will be logged in text_metrics
-                       
-                        # Debug: Log the full result structure
-                        debug_info = {
-                            "result_type": type(r).__name__,
-                            "result_keys": list(r.keys()) if isinstance(r, dict) else "not_dict",
-                            "result_repr": str(r)[:200] if not isinstance(r, dict) else None
-                        }
-                       
-                        # Handle different result structures - check both "passed" and result["result"] == "passed"
-                        attempt1_passed = None
-                        if isinstance(r, dict):
-                            # Try "passed" field first (most common)
-                            if "passed" in r:
-                                passed_value = r["passed"]
-                                debug_info["passed_value"] = passed_value
-                                debug_info["passed_type"] = type(passed_value).__name__
-                                # Handle both boolean and string representations
-                                if isinstance(passed_value, bool):
-                                    attempt1_passed = passed_value
-                                elif isinstance(passed_value, str):
-                                    attempt1_passed = passed_value.lower() in ("true", "passed", "1", "yes")
-                                elif passed_value is None:
-                                    attempt1_passed = None
+
+            # Per-attempt tracking
+            attempts_passed = []
+            attempts_eval = []
+            attempts_metrics = []
+
+            # Run N attempts
+            for attempt_index in range(1, attempts_per_task + 1):
+                attempt_output = ""
+                attempt_code = ""
+                attempt_eval = None
+                attempt_passed = None
+                attempt_metrics = {}
+
+                try:
+                    attempt_output = run_ollama(model, prompt)
+                    attempt_code = extract_python_code(attempt_output)
+                    if not attempt_code.strip() and attempt_output.strip():
+                        attempt_code = attempt_output.strip()
+
+                    # Evaluate
+                    completion = None
+                    eval_skipped_reason = None
+                    if not human_eval_exec:
+                        eval_skipped_reason = "human_eval_exec is None"
+                    elif not attempt_code.strip():
+                        eval_skipped_reason = "attempt_code is empty"
+
+                    if human_eval_exec and attempt_code.strip():
+                        try:
+                            completion = normalize_humaneval_completion(prompt, attempt_code)
+                            r = check_correctness_windows(task, completion, timeout_s=30.0)
+                            attempt_eval = r
+
+                            debug_info = {
+                                "result_type": type(r).__name__,
+                                "result_keys": list(r.keys()) if isinstance(r, dict) else "not_dict",
+                                "result_repr": str(r)[:200] if not isinstance(r, dict) else None,
+                            }
+
+                            attempt_passed = None
+                            if isinstance(r, dict):
+                                if "passed" in r:
+                                    passed_value = r["passed"]
+                                    debug_info["passed_value"] = passed_value
+                                    debug_info["passed_type"] = type(passed_value).__name__
+                                    if isinstance(passed_value, bool):
+                                        attempt_passed = passed_value
+                                    elif isinstance(passed_value, str):
+                                        attempt_passed = passed_value.lower() in ("true", "passed", "1", "yes")
+                                    elif passed_value is None:
+                                        attempt_passed = None
+                                    else:
+                                        attempt_passed = bool(passed_value)
+                                elif "result" in r:
+                                    result_value = r["result"]
+                                    debug_info["result_value"] = result_value
+                                    attempt_passed = (result_value == "passed" or result_value is True)
                                 else:
-                                    attempt1_passed = bool(passed_value)
-                            # Also check "result" field (HumanEval sometimes uses this)
-                            elif "result" in r:
-                                result_value = r["result"]
-                                debug_info["result_value"] = result_value
-                                attempt1_passed = (result_value == "passed" or result_value is True)
+                                    debug_info["no_passed_or_result"] = True
+                                    attempt_passed = False
                             else:
-                                # Fallback: check if result indicates success
-                                debug_info["no_passed_or_result"] = True
-                                attempt1_passed = False
-                        else:
-                            debug_info["not_dict"] = True
-                            attempt1_passed = False
-                       
-                        # Add debug info to eval result
-                        if isinstance(attempt1_eval, dict):
-                            attempt1_eval["_debug"] = debug_info
-                        else:
-                            attempt1_eval = {"result": str(attempt1_eval), "_debug": debug_info}
-                    except Exception as e:
-                        attempt1_eval = {"exception": str(e), "exception_type": type(e).__name__}
-                        attempt1_passed = None
-               
-                # Compute metrics for attempt 1 (only if it passed tests)
-                # Note: We only compute metrics on working code to avoid misleading measurements
-                # on examples or non-functional code that the model might generate
-                if compute_metrics and attempt1_code.strip() and attempt1_passed is True:
-                    code_for_metrics = prompt + "\n" + attempt1_code
-                    attempt1_metrics = analyze_code_metrics(code_for_metrics, metrics_to_compute=metrics_to_compute)
-               
-                # Log attempt 1
-                text_metrics_1 = {}
-                if attempt1_eval:
-                    text_metrics_1["humaneval_result"] = attempt1_eval
-                    # Log the result string for easy debugging
-                    if isinstance(attempt1_eval, dict) and "result" in attempt1_eval:
-                        text_metrics_1["humaneval_result_string"] = attempt1_eval["result"]
-                if completion1 is not None:
-                    text_metrics_1["normalized_completion"] = completion1
-                if eval_skipped_reason:
-                    text_metrics_1["eval_skipped"] = eval_skipped_reason
-                # Always log the raw passed value for debugging
-                text_metrics_1["_debug_attempt1_passed"] = attempt1_passed
-                save_experiment_log(
-                    model_name=model,
-                    prompt=prompt,
-                    output=attempt1_output,
-                    code=attempt1_code,
-                    metrics=attempt1_metrics,
-                    text_metrics=text_metrics_1,
-                    similarity_score=None,
-                    rag_enabled=False,
-                    task_id=task_id,
-                    pass_1=1 if attempt1_passed else (0 if attempt1_passed is False else None),
-                    run_id=run_id,
-                    attempt_index=1,
-                )
-            except Exception as e:
-                # Log the error instead of silently swallowing it
-                error_metrics = {"error": str(e)}
-                if 'attempt1_eval' in locals() and attempt1_eval:
-                    error_metrics["humaneval_result"] = attempt1_eval
-                save_experiment_log(
-                    model_name=model,
-                    prompt=prompt,
-                    output=attempt1_output if 'attempt1_output' in locals() else "",
-                    code=attempt1_code if 'attempt1_code' in locals() else "",
-                    metrics=attempt1_metrics if 'attempt1_metrics' in locals() else {},
-                    text_metrics=error_metrics,
-                    similarity_score=None,
-                    rag_enabled=False,
-                    task_id=task_id,
-                    pass_1=None,
-                    run_id=run_id,
-                    attempt_index=1,
-                )
-           
-            # Attempt 2
-            try:
-                attempt2_output = run_ollama(model, prompt)
-                attempt2_code = extract_python_code(attempt2_output)
-                if not attempt2_code.strip() and attempt2_output.strip():
-                    attempt2_code = attempt2_output.strip()
-               
-                # Evaluate attempt 2
-                completion2 = None
-                eval_skipped_reason_2 = None
-                if not human_eval_exec:
-                    eval_skipped_reason_2 = "human_eval_exec is None"
-                elif not attempt2_code.strip():
-                    eval_skipped_reason_2 = "attempt2_code is empty"
-               
-                if human_eval_exec and attempt2_code.strip():
-                    try:
-                        # Normalize completion (HumanEval expects completion, not redefined def)
-                        completion2 = normalize_humaneval_completion(prompt, attempt2_code)
-                        # Use Windows-safe multiprocessing-based timeout wrapper (no signals)
-                        r = check_correctness_windows(task, completion2, timeout_s=30.0)
-                        attempt2_eval = r
-                        # Debug: Log completion and result (for troubleshooting)
-                        if isinstance(r, dict) and "result" in r:
-                            pass  # Result will be logged in text_metrics
-                       
-                        # Debug: Log the full result structure
-                        debug_info = {
-                            "result_type": type(r).__name__,
-                            "result_keys": list(r.keys()) if isinstance(r, dict) else "not_dict",
-                            "result_repr": str(r)[:200] if not isinstance(r, dict) else None
-                        }
-                       
-                        # Handle different result structures - check both "passed" and result["result"] == "passed"
-                        attempt2_passed = None
-                        if isinstance(r, dict):
-                            # Try "passed" field first (most common)
-                            if "passed" in r:
-                                passed_value = r["passed"]
-                                debug_info["passed_value"] = passed_value
-                                debug_info["passed_type"] = type(passed_value).__name__
-                                # Handle both boolean and string representations
-                                if isinstance(passed_value, bool):
-                                    attempt2_passed = passed_value
-                                elif isinstance(passed_value, str):
-                                    attempt2_passed = passed_value.lower() in ("true", "passed", "1", "yes")
-                                elif passed_value is None:
-                                    attempt2_passed = None
-                                else:
-                                    attempt2_passed = bool(passed_value)
-                            # Also check "result" field (HumanEval sometimes uses this)
-                            elif "result" in r:
-                                result_value = r["result"]
-                                debug_info["result_value"] = result_value
-                                attempt2_passed = (result_value == "passed" or result_value is True)
+                                debug_info["not_dict"] = True
+                                attempt_passed = False
+
+                            if isinstance(attempt_eval, dict):
+                                attempt_eval["_debug"] = debug_info
                             else:
-                                # Fallback: check if result indicates success
-                                debug_info["no_passed_or_result"] = True
-                                attempt2_passed = False
-                        else:
-                            debug_info["not_dict"] = True
-                            attempt2_passed = False
-                       
-                        # Add debug info to eval result
-                        if isinstance(attempt2_eval, dict):
-                            attempt2_eval["_debug"] = debug_info
-                        else:
-                            attempt2_eval = {"result": str(attempt2_eval), "_debug": debug_info}
-                    except Exception as e:
-                        attempt2_eval = {"exception": str(e), "exception_type": type(e).__name__}
-                        attempt2_passed = None
-               
-                # Compute metrics for attempt 2 (only if it passed tests)
-                # Note: We only compute metrics on working code to avoid misleading measurements
-                # on examples or non-functional code that the model might generate
-                if compute_metrics and attempt2_code.strip() and attempt2_passed is True:
-                    code_for_metrics = prompt + "\n" + attempt2_code
-                    attempt2_metrics = analyze_code_metrics(code_for_metrics, metrics_to_compute=metrics_to_compute)
-               
-                # Log attempt 2
-                text_metrics_2 = {}
-                if attempt2_eval:
-                    text_metrics_2["humaneval_result"] = attempt2_eval
-                    # Log the result string for easy debugging
-                    if isinstance(attempt2_eval, dict) and "result" in attempt2_eval:
-                        text_metrics_2["humaneval_result_string"] = attempt2_eval["result"]
-                if completion2 is not None:
-                    text_metrics_2["normalized_completion"] = completion2
-                if eval_skipped_reason_2:
-                    text_metrics_2["eval_skipped"] = eval_skipped_reason_2
-                # Always log the raw passed value for debugging
-                text_metrics_2["_debug_attempt2_passed"] = attempt2_passed
-                save_experiment_log(
-                    model_name=model,
-                    prompt=prompt,
-                    output=attempt2_output,
-                    code=attempt2_code,
-                    metrics=attempt2_metrics,
-                    text_metrics=text_metrics_2,
-                    similarity_score=None,
-                    rag_enabled=False,
-                    task_id=task_id,
-                    pass_1=1 if attempt2_passed else (0 if attempt2_passed is False else None),
-                    run_id=run_id,
-                    attempt_index=2,
-                )
-            except Exception as e:
-                # Log the error instead of silently swallowing it
-                error_metrics = {"error": str(e)}
-                if 'attempt2_eval' in locals() and attempt2_eval:
-                    error_metrics["humaneval_result"] = attempt2_eval
-                save_experiment_log(
-                    model_name=model,
-                    prompt=prompt,
-                    output=attempt2_output if 'attempt2_output' in locals() else "",
-                    code=attempt2_code if 'attempt2_code' in locals() else "",
-                    metrics=attempt2_metrics if 'attempt2_metrics' in locals() else {},
-                    text_metrics=error_metrics,
-                    similarity_score=None,
-                    rag_enabled=False,
-                    task_id=task_id,
-                    pass_1=None,
-                    run_id=run_id,
-                    attempt_index=2,
-                )
-           
-            # Compute aggregated metrics using Pass@k formula
-            # Count total attempts (n) and correct attempts (c)
-            n = 2  # Total number of attempts
-            c = 0  # Number of correct attempts
-            
-            # Count correct attempts
-            if attempt1_passed is True:
-                c += 1
-            if attempt2_passed is True:
-                c += 1
-            
-            # Pass@1: just the first attempt
-            pass_1 = 1 if attempt1_passed else (0 if attempt1_passed is False else None)
-            
-            # Pass@k using the proper formula
-            # Handle cases where evaluation didn't run
-            if attempt1_passed is None and attempt2_passed is None:
-                pass_k_2 = None
+                                attempt_eval = {"result": str(attempt_eval), "_debug": debug_info}
+                        except Exception as e:
+                            attempt_eval = {"exception": str(e), "exception_type": type(e).__name__}
+                            attempt_passed = None
+
+                    # Metrics (only if passed)
+                    if compute_metrics and attempt_code.strip() and attempt_passed is True:
+                        code_for_metrics = prompt + "\n" + attempt_code
+                        attempt_metrics = analyze_code_metrics(code_for_metrics, metrics_to_compute=metrics_to_compute)
+
+                    # Log attempt
+                    text_metrics = {}
+                    if attempt_eval:
+                        text_metrics["humaneval_result"] = attempt_eval
+                        if isinstance(attempt_eval, dict) and "result" in attempt_eval:
+                            text_metrics["humaneval_result_string"] = attempt_eval["result"]
+                    if completion is not None:
+                        text_metrics["normalized_completion"] = completion
+                    if eval_skipped_reason:
+                        text_metrics["eval_skipped"] = eval_skipped_reason
+                    text_metrics["_debug_attempt_passed"] = attempt_passed
+
+                    save_experiment_log(
+                        model_name=model,
+                        prompt=prompt,
+                        output=attempt_output,
+                        code=attempt_code,
+                        metrics=attempt_metrics,
+                        text_metrics=text_metrics,
+                        similarity_score=None,
+                        rag_enabled=False,
+                        task_id=task_id,
+                        pass_1=1 if attempt_passed else (0 if attempt_passed is False else None),
+                        run_id=run_id,
+                        attempt_index=attempt_index,
+                    )
+                except Exception as e:
+                    error_metrics = {"error": str(e)}
+                    if attempt_eval:
+                        error_metrics["humaneval_result"] = attempt_eval
+                    save_experiment_log(
+                        model_name=model,
+                        prompt=prompt,
+                        output=attempt_output,
+                        code=attempt_code,
+                        metrics=attempt_metrics,
+                        text_metrics=error_metrics,
+                        similarity_score=None,
+                        rag_enabled=False,
+                        task_id=task_id,
+                        pass_1=None,
+                        run_id=run_id,
+                        attempt_index=attempt_index,
+                    )
+
+                attempts_passed.append(attempt_passed)
+                attempts_eval.append(attempt_eval)
+                attempts_metrics.append(attempt_metrics)
+
+            # Aggregate metrics using Pass@k
+            n = attempts_per_task
+            c = sum(1 for p in attempts_passed if p is True)
+
+            # Pass@1 from first attempt
+            if attempts_passed:
+                if attempts_passed[0] is True:
+                    pass_1 = 1
+                elif attempts_passed[0] is False:
+                    pass_1 = 0
+                else:
+                    pass_1 = None
             else:
-                # Use the estimate_pass_at_k function with k=2
-                # If any attempt is None, we still count n=2 but only count True as correct
-                pass_k_2 = estimate_pass_at_k(n=n, c=c, k=2)
-           
-            # Build aggregated row
-            # Debug: store raw evaluation results to CSV for debugging
+                pass_1 = None
+
+            # Pass@k with k = attempts_per_task
+            if not attempts_passed or all(p is None for p in attempts_passed):
+                pass_k = None
+            else:
+                pass_k = estimate_pass_at_k(n=n, c=c, k=attempts_per_task)
+
+            # Backwards-compatible debug fields for first two attempts
+            attempt1_passed = attempts_passed[0] if len(attempts_passed) >= 1 else None
+            attempt2_passed = attempts_passed[1] if len(attempts_passed) >= 2 else None
+            attempt1_eval = attempts_eval[0] if len(attempts_eval) >= 1 else None
+            attempt2_eval = attempts_eval[1] if len(attempts_eval) >= 2 else None
+            attempt1_metrics = attempts_metrics[0] if len(attempts_metrics) >= 1 else {}
+            attempt2_metrics = attempts_metrics[1] if len(attempts_metrics) >= 2 else {}
+
             attempt1_result_str = None
             attempt2_result_str = None
             if attempt1_eval:
@@ -955,24 +837,24 @@ def run_batch_evaluation(models, task_ids, problems, compute_metrics=True, metri
                     attempt2_result_str = attempt2_eval.get("result", "unknown")
                 else:
                     attempt2_result_str = str(attempt2_eval)
-           
+
             row = {
                 "run_id": run_id,
                 "timestamp": datetime.now().isoformat(),
                 "model": model,
                 "task_id": task_id,
-                "k": 2,
-                "n_total_attempts": n,  # Total attempts (should be 2)
-                "c_correct_attempts": c,  # Number of correct attempts
+                "k": attempts_per_task,
+                "n_total_attempts": n,
+                "c_correct_attempts": c,
                 "pass_1": pass_1,
-                "pass_k": pass_k_2,
-                "pass_k_2": pass_k_2,
+                "pass_k": pass_k,
+                "pass_k_2": pass_k,
                 "attempt1_passed": 1 if attempt1_passed is True else (0 if attempt1_passed is False else None),
                 "attempt2_passed": 1 if attempt2_passed is True else (0 if attempt2_passed is False else None),
-                "attempt1_result": attempt1_result_str,  # Debug field
-                "attempt2_result": attempt2_result_str,  # Debug field
-                "attempt1_passed_raw": attempt1_passed,  # Debug: raw boolean/None
-                "attempt2_passed_raw": attempt2_passed,  # Debug: raw boolean/None
+                "attempt1_result": attempt1_result_str,
+                "attempt2_result": attempt2_result_str,
+                "attempt1_passed_raw": attempt1_passed,
+                "attempt2_passed_raw": attempt2_passed,
                 "attempt1_cyclomatic_complexity": attempt1_metrics.get("cyclomatic_complexity"),
                 "attempt1_cognitive_complexity": attempt1_metrics.get("cognitive_complexity"),
                 "attempt1_halstead_effort": attempt1_metrics.get("halstead_effort"),
@@ -1664,6 +1546,14 @@ if batch_mode:
            
             # Batch options
             st.markdown("### ⚙️ Batch Options")
+            attempts_per_task = st.number_input(
+                "Number of attempts per (model, task)",
+                min_value=1,
+                max_value=10,
+                value=5,
+                step=1,
+                key="batch_attempts_per_task",
+            )
             batch_compute_metrics = st.checkbox("Compute metrics for each attempt", value=True, key="batch_metrics")
 
             batch_metrics_to_compute = set()
@@ -1692,7 +1582,7 @@ if batch_mode:
                 if not batch_metrics_to_compute:
                     st.warning("No metrics selected — metrics will be skipped.")
 
-            st.info("Batch pass@k is set to k=2")
+            st.info("Batch pass@k uses k = number of attempts per (model, task).")
            
             # Run batch button
             if st.button("🚀 Run Batch Evaluation", type="primary", disabled=(not selected_models or not selected_task_ids)):
@@ -1700,7 +1590,7 @@ if batch_mode:
                     st.error("Please select at least one model and one task.")
                 else:
                     total_jobs = len(selected_models) * len(selected_task_ids)
-                    st.info(f"Starting batch: {len(selected_models)} models × {len(selected_task_ids)} tasks = {total_jobs} jobs (2 attempts each)")
+                    st.info(f"Starting batch: {len(selected_models)} models × {len(selected_task_ids)} tasks = {total_jobs} jobs ({attempts_per_task} attempt(s) each)")
                    
                     progress_bar = st.progress(0)
                     status_text = st.empty()
@@ -1714,6 +1604,7 @@ if batch_mode:
                             problems=problems,
                             compute_metrics=effective_compute_metrics,
                             metrics_to_compute=batch_metrics_to_compute if effective_compute_metrics else None,
+                            attempts_per_task=int(attempts_per_task),
                             progress_bar=progress_bar,
                             status_text=status_text,
                         )
