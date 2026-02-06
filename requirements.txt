@@ -1,0 +1,11 @@
+streamlit
+pandas
+numpy
+supabase-py
+human-eval
+radon
+cognitive-complexity
+openpyxl
+sentence-transformers
+PyPDF2
+
