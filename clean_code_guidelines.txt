@@ -1,0 +1,5 @@
+Guideline: Functions should be small and do one thing only.
+Guideline: Use descriptive variable names (e.g., 'user_age' instead of 'x').
+Guideline: Avoid deep nesting of if-statements; use guard clauses instead.
+Guideline: Add docstrings to explain complex logic.
+Example: Instead of 'if x > 0: if y > 0: do_something()', use 'if x <= 0: return; if y <= 0: return; do_something()'.
