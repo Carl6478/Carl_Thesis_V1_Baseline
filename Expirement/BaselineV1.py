@@ -8,6 +8,7 @@ import json
 import os
 import multiprocessing as mp
 import traceback
+import uuid
 from datetime import datetime
 from math import comb
 from io import BytesIO
@@ -100,7 +101,11 @@ def save_experiment_log(
     run_id=None,
     attempt_index=None,
 ):
+    # Generate a unique ID for this log entry (for easy referencing later)
+    log_id = uuid.uuid4().hex
+
     entry = {
+        "log_id": log_id,
         "timestamp": datetime.now().isoformat(),
         "run_id": run_id,
         "attempt_index": attempt_index,
@@ -120,12 +125,13 @@ def save_experiment_log(
     with open("experiment_logs.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
 
-    # New: send to Supabase (best-effort, non-fatal on failure)
+    # New: send to Supabase 
     try:
         sb = get_supabase_client()
         if sb:
             # Ensure JSON-serializable object for PostgREST
             sb_entry = {
+                "log_id": log_id,
                 "timestamp": entry["timestamp"],
                 "run_id": entry["run_id"],
                 "attempt_index": entry["attempt_index"],
@@ -162,8 +168,13 @@ def save_single_run_log(
     """
     Separate logger for the simple one-off "Run Model" path.
     Writes to a dedicated Supabase table: single_runs.
+    Each entry also gets a globally unique run_id for easier referencing.
     """
+    # Short, readable run ID (e.g. run_2f4a9b1c)
+    run_id = "run_" + uuid.uuid4().hex[:8]
+
     entry = {
+        "run_id": run_id,
         "timestamp": datetime.now().isoformat(),
         "model": model_name,
         "prompt": prompt,
@@ -190,6 +201,74 @@ def save_single_run_log(
         sb = get_supabase_client()
         if sb:
             sb.table("single_runs").insert(entry).execute()
+    except Exception:
+        traceback.print_exc()
+
+
+def save_pass_at_k_run(
+    model_name,
+    task_id,
+    task_prompt,
+    canonical_solution,
+    use_humaneval,
+    rag_enabled,
+    pass_1,
+    pass_k,
+    k,
+    n_attempts,
+    c_passed,
+    attempts,
+    raw_output_attempt1,
+    extracted_code_attempt1,
+    metrics_attempt1,
+    similarity_score=None,
+):
+    """
+    Save a pass@k run to Supabase (table: pass_at_k_runs) and optionally to local JSONL.
+    So you can retrieve and view Full Model Output, Generated Code, Canonical, Task Prompt,
+    Metrics, and all attempts from the Results page.
+    """
+    # Short, readable run ID (e.g. run_2f4a9b1c)
+    run_id = "run_" + uuid.uuid4().hex[:8]
+    # Build JSON-serializable attempts (Supabase jsonb)
+    attempts_data = []
+    for a in attempts:
+        attempts_data.append({
+            "attempt": a.get("attempt"),
+            "output": a.get("output") or "",
+            "code": a.get("code") or "",
+            "passed": a.get("passed"),
+            "metrics": a.get("metrics") or {},
+        })
+    entry = {
+        "run_id": run_id,
+        "timestamp": datetime.now().isoformat(),
+        "model": model_name,
+        "task_id": task_id,
+        "task_prompt": task_prompt,
+        "canonical_solution": canonical_solution,
+        "use_humaneval": use_humaneval,
+        "rag_enabled": rag_enabled,
+        "pass_1": pass_1,
+        "pass_k": pass_k,
+        "k": k,
+        "n_attempts": n_attempts,
+        "c_passed": c_passed,
+        "attempts": attempts_data,
+        "raw_output": raw_output_attempt1,
+        "extracted_code": extracted_code_attempt1,
+        "metrics": metrics_attempt1,
+        "similarity_score": similarity_score,
+    }
+    try:
+        with open("pass_at_k_run_logs.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        traceback.print_exc()
+    try:
+        sb = get_supabase_client()
+        if sb:
+            sb.table("pass_at_k_runs").insert(entry).execute()
     except Exception:
         traceback.print_exc()
 
@@ -516,10 +595,11 @@ def load_text_from_file(uploaded_file):
 # ---------------------------------------------------------
 #  Metrics (ONLY requested)
 # ---------------------------------------------------------
-def analyze_code_metrics(code: str, metrics_to_compute=None):
+def analyze_code_metrics(code: str, metrics_to_compute=None, code_for_loc=None):
     """
     Computes:
-      - Lines of Code (LOC)
+      - Lines of Code (LOC) - excluding comments
+      - Comment count - number of lines that are comments (start with #)
       - Cyclomatic Complexity (CC) via radon.cc_visit
       - Cognitive Complexity via cognitive_complexity
       - Halstead Effort via radon.metrics.h_visit
@@ -528,9 +608,15 @@ def analyze_code_metrics(code: str, metrics_to_compute=None):
       - Optional iterable of metric keys to compute
         (e.g. {"lines_of_code", "cyclomatic_complexity"}).
       - If None, all metrics are computed (default behavior).
+    
+    code_for_loc:
+      - Optional separate code string to use for LOC, comment count, and all complexity
+        metrics (CC, cognitive, Halstead). If None, uses the main `code` parameter.
+      - Use this so metrics reflect generated code only (e.g. exclude prompt stubs).
     """
     result = {
         "lines_of_code": None,
+        "comment_count": None,
         "cyclomatic_complexity": None,
         "cognitive_complexity": None,
         "halstead_effort": None,
@@ -543,29 +629,46 @@ def analyze_code_metrics(code: str, metrics_to_compute=None):
     if not code or not code.strip():
         return result
 
+    # Use generated-code-only when provided (for LOC and all complexity metrics)
+    loc_code = code_for_loc if code_for_loc is not None else code
+    complexity_code = code_for_loc if code_for_loc is not None else code
 
-    # Lines of Code (non-empty lines)
-    if metrics_to_compute is None or "lines_of_code" in metrics_to_compute:
+    # Lines of Code (excluding comments) and Comment count
+    if metrics_to_compute is None or any(m in metrics_to_compute for m in ["lines_of_code", "comment_count"]):
         try:
-            lines = [line.strip() for line in code.splitlines() if line.strip()]
-            result["lines_of_code"] = len(lines)
+            raw_lines = [line.strip() for line in loc_code.splitlines() if line.strip()]
+            
+            # Identify which lines are comments (start with #)
+            comment_lines = [l for l in raw_lines if l.startswith('#')]
+            # Identify which lines are actual code (not starting with #)
+            code_only_lines = [l for l in raw_lines if not l.startswith('#')]
+            
+            # Calculate Lines of Code (excluding comments)
+            if metrics_to_compute is None or "lines_of_code" in metrics_to_compute:
+                result["lines_of_code"] = len(code_only_lines)
+                
+            # Comment count: number of lines that are comments
+            if metrics_to_compute is None or "comment_count" in metrics_to_compute:
+                result["comment_count"] = len(comment_lines)
+                    
         except Exception:
             result["lines_of_code"] = None
+            result["comment_count"] = None
 
 
-    # Cyclomatic Complexity (Radon)
+    # Cyclomatic Complexity (Radon) — on generated code only when code_for_loc provided
     if (metrics_to_compute is None or "cyclomatic_complexity" in metrics_to_compute) and radon_cc:
         try:
-            cc_blocks = radon_cc(code)
+            cc_blocks = radon_cc(complexity_code)
             result["cyclomatic_complexity"] = sum(x.complexity for x in cc_blocks) if cc_blocks else 0
         except Exception:
             result["cyclomatic_complexity"] = None
 
 
-    # Cognitive Complexity (requires AST + functions)
+    # Cognitive Complexity (requires AST + functions) — on generated code only when code_for_loc provided
     if metrics_to_compute is None or "cognitive_complexity" in metrics_to_compute:
         try:
-            tree = ast.parse(code)
+            tree = ast.parse(complexity_code)
             ast_ok = True
         except SyntaxError:
             tree = None
@@ -587,10 +690,10 @@ def analyze_code_metrics(code: str, metrics_to_compute=None):
                 result["cognitive_complexity"] = None
 
 
-    # Halstead Effort (Radon) ✅ FIXED
+    # Halstead Effort (Radon) — on generated code only when code_for_loc provided
     if (metrics_to_compute is None or "halstead_effort" in metrics_to_compute) and radon_halstead:
         try:
-            h = radon_halstead(code)
+            h = radon_halstead(complexity_code)
 
 
             effort = None
@@ -745,7 +848,7 @@ def run_batch_evaluation(
                     # Metrics (only if passed)
                     if compute_metrics and attempt_code.strip() and attempt_passed is True:
                         code_for_metrics = prompt + "\n" + attempt_code
-                        attempt_metrics = analyze_code_metrics(code_for_metrics, metrics_to_compute=metrics_to_compute)
+                        attempt_metrics = analyze_code_metrics(code_for_metrics, metrics_to_compute=metrics_to_compute, code_for_loc=attempt_code)
 
                     # Log attempt
                     text_metrics = {}
@@ -839,6 +942,7 @@ def run_batch_evaluation(
                     attempt2_result_str = str(attempt2_eval)
 
             row = {
+                "result_id": uuid.uuid4().hex,
                 "run_id": run_id,
                 "timestamp": datetime.now().isoformat(),
                 "model": model,
@@ -855,9 +959,13 @@ def run_batch_evaluation(
                 "attempt2_result": attempt2_result_str,
                 "attempt1_passed_raw": attempt1_passed,
                 "attempt2_passed_raw": attempt2_passed,
+                "attempt1_lines_of_code": attempt1_metrics.get("lines_of_code"),
+                "attempt1_comment_count": attempt1_metrics.get("comment_count"),
                 "attempt1_cyclomatic_complexity": attempt1_metrics.get("cyclomatic_complexity"),
                 "attempt1_cognitive_complexity": attempt1_metrics.get("cognitive_complexity"),
                 "attempt1_halstead_effort": attempt1_metrics.get("halstead_effort"),
+                "attempt2_lines_of_code": attempt2_metrics.get("lines_of_code"),
+                "attempt2_comment_count": attempt2_metrics.get("comment_count"),
                 "attempt2_cyclomatic_complexity": attempt2_metrics.get("cyclomatic_complexity"),
                 "attempt2_cognitive_complexity": attempt2_metrics.get("cognitive_complexity"),
                 "attempt2_halstead_effort": attempt2_metrics.get("halstead_effort"),
@@ -949,7 +1057,7 @@ if page == "Results":
 
     table = st.selectbox(
         "Select results table",
-        ["single_runs", "experiment_logs", "batch_results"],
+        ["single_runs", "pass_at_k_runs", "experiment_logs", "batch_results"],
         index=0,
     )
     limit = st.number_input("Max rows to load", min_value=1, max_value=50, value=10, step=1)
@@ -988,21 +1096,27 @@ if page == "Results":
         sort_order = st.selectbox("Sort order", ["Newest first", "Oldest first"], index=0)
     with c3:
         rag_filter = None
-        if table in ("single_runs", "experiment_logs"):
+        if table in ("single_runs", "pass_at_k_runs", "experiment_logs"):
             rag_filter = st.selectbox("RAG", ["All", "On", "Off"], index=0)
         else:
             st.caption("RAG filter not available for this table.")
 
+    search_term = st.text_input(
+        "Search",
+        placeholder="Search run_id, task_id, model...",
+        key="results_search",
+    ).strip()
+
     try:
         query = sb.table(table).select("*")
         # Most tables have a timestamp column; order desc if present
-        if table in ("single_runs", "experiment_logs", "batch_results"):
+        if table in ("single_runs", "pass_at_k_runs", "experiment_logs", "batch_results"):
             query = query.order("timestamp", desc=(sort_order == "Newest first"))
 
         # Apply filters (best-effort; skips when not applicable)
         if selected_model_filter and selected_model_filter != "All models":
             query = query.eq("model", selected_model_filter)
-        if rag_filter and rag_filter != "All" and table in ("single_runs", "experiment_logs"):
+        if rag_filter and rag_filter != "All" and table in ("single_runs", "pass_at_k_runs", "experiment_logs"):
             query = query.eq("rag_enabled", rag_filter == "On")
 
         res = query.limit(int(limit)).execute()
@@ -1011,8 +1125,24 @@ if page == "Results":
         if rows is None and isinstance(res, dict):
             rows = res.get("data")
 
+        # Client-side search across run_id, task_id, model (and id/log_id/result_id if present)
+        if rows and search_term:
+            term_lower = search_term.lower()
+            searchable_keys = ["run_id", "task_id", "model", "log_id", "result_id"]
+            filtered = []
+            for r in rows:
+                for key in searchable_keys:
+                    val = r.get(key)
+                    if val is not None and term_lower in str(val).lower():
+                        filtered.append(r)
+                        break
+            rows = filtered
+
         if not rows:
-            st.info("No rows found in this table yet.")
+            if search_term:
+                st.info("No rows match your search. Try a different term or clear the search.")
+            else:
+                st.info("No rows found in this table yet.")
         else:
             df = pd.DataFrame(rows)
             st.dataframe(df, use_container_width=True)
@@ -1075,6 +1205,51 @@ if page == "Results":
                                 st.markdown("#### 🧪 HumanEval / Text Metrics")
                                 st.json(row.get("text_overlap"))
 
+                        # Pass@k runs: same layout as run page (full output, generated vs canonical, metrics, attempts)
+                        elif table == "pass_at_k_runs":
+                            st.markdown("#### 🧠 Full Model Output (Attempt 1)")
+                            st.code(row.get("raw_output") or "# (no output)", language="python")
+                            col_gen, col_can = st.columns(2)
+                            with col_gen:
+                                st.markdown("#### 🧩 Generated Code (Attempt 1)")
+                                st.code(row.get("extracted_code") or "# (no code extracted)", language="python")
+                            with col_can:
+                                st.markdown("#### 📌 Canonical Solution")
+                                canonical = row.get("canonical_solution")
+                                if canonical:
+                                    st.code(canonical, language="python")
+                                else:
+                                    st.info("No canonical solution available.")
+                            task_prompt_val = row.get("task_prompt")
+                            if task_prompt_val:
+                                st.markdown("#### 📜 Task Prompt")
+                                st.code(task_prompt_val, language="python")
+                            if row.get("metrics"):
+                                st.markdown("#### 📊 Code Metrics (Attempt 1)")
+                                st.json(row.get("metrics"))
+                            st.markdown("#### 📐 Pass@k Summary")
+                            st.json({
+                                "pass_1": row.get("pass_1"),
+                                "pass_k": row.get("pass_k"),
+                                "k": row.get("k"),
+                                "n_attempts": row.get("n_attempts"),
+                                "c_passed": row.get("c_passed"),
+                            })
+                            if row.get("similarity_score") is not None:
+                                st.metric("Semantic similarity (0–1)", round(float(row["similarity_score"]), 4))
+                            attempts_data = row.get("attempts") or []
+                            if attempts_data:
+                                st.markdown("#### 🔄 Attempts")
+                                for idx, att in enumerate(attempts_data):
+                                    lab = att.get("attempt", idx + 1)
+                                    status = "✅ PASSED" if att.get("passed") else ("❌ FAILED" if att.get("passed") is False else "⚠️ ERROR")
+                                    with st.expander(f"Attempt {lab} — {status}", expanded=False):
+                                        st.markdown("**Raw output**")
+                                        st.code(att.get("output") or "", language="text")
+                                        st.markdown("**Extracted code**")
+                                        st.code(att.get("code") or "# (none)", language="python")
+                                        if att.get("metrics"):
+                                            st.json(att["metrics"])
                         # Batch results: show summary metrics
                         elif table == "batch_results":
                             st.markdown("#### 📊 Batch Summary Fields")
@@ -1151,7 +1326,36 @@ if enable_rag:
 
 
 st.markdown("### ⚙️ Analysis Controls")
-enable_metrics = st.checkbox("Enable LOC + CC + Cognitive + Halstead Effort", value=True)
+enable_metrics = st.checkbox("Enable LOC + Comment count + CC + Cognitive + Halstead Effort", value=True)
+
+metrics_to_compute = set()
+if enable_metrics:
+    st.markdown("**Select which metrics to compute:**")
+    metric_label_to_key = {
+        "Lines of Code (LOC)": "lines_of_code",
+        "Comment count": "comment_count",
+        "Cyclomatic Complexity (CC)": "cyclomatic_complexity",
+        "Cognitive Complexity": "cognitive_complexity",
+        "Halstead Effort": "halstead_effort",
+    }
+    default_metric_labels = [
+        "Lines of Code (LOC)",
+        "Comment count",
+        "Cyclomatic Complexity (CC)",
+        "Cognitive Complexity",
+        "Halstead Effort",
+    ]
+    selected_metric_labels = st.multiselect(
+        "Metrics",
+        options=list(metric_label_to_key.keys()),
+        default=default_metric_labels,
+        key="single_run_metric_list",
+    )
+    metrics_to_compute = {metric_label_to_key[label] for label in selected_metric_labels}
+    
+    if not metrics_to_compute:
+        st.warning("No metrics selected — metrics will be skipped.")
+
 enable_similarity = st.checkbox("Enable similarity", value=True)
 
 
@@ -1186,7 +1390,7 @@ if st.button("Run Model", type="primary", disabled=(not models)):
         attempts = []
         passed_attempts = []
        
-        st.markdown(f"## 🔄 Running {pass_at_k_value} attempt(s) for pass@{pass_at_k_value}")
+        st.markdown(f"## 🔄 Running up to {pass_at_k_value} attempt(s) for pass@{pass_at_k_value} (stop when pass)")
         progress_bar = st.progress(0)
        
         for i in range(pass_at_k_value):
@@ -1221,10 +1425,6 @@ if st.button("Run Model", type="primary", disabled=(not models)):
                     # Normalize completion (HumanEval expects completion, not redefined def)
                     completion = normalize_humaneval_completion(task_prompt, output_code)
                     
-                    # Show what will be tested
-                    with st.expander("🔍 Normalized Completion (what gets tested)", expanded=False):
-                        st.code(completion, language="python")
-                    
                     # Use Windows-safe multiprocessing-based timeout wrapper (no signals)
                     result = check_correctness_windows(task, completion, timeout_s=30.0)
                     eval_result = result
@@ -1258,8 +1458,8 @@ if st.button("Run Model", type="primary", disabled=(not models)):
             # Note: We only compute metrics on working code to avoid misleading measurements
             attempt_metrics = {}
             code_for_metrics = task_prompt + "\n" + output_code if output_code.strip() else ""
-            if enable_metrics and code_for_metrics.strip() and attempt_passed is True:
-                attempt_metrics = analyze_code_metrics(code_for_metrics)
+            if enable_metrics and bool(metrics_to_compute) and code_for_metrics.strip() and attempt_passed is True:
+                attempt_metrics = analyze_code_metrics(code_for_metrics, metrics_to_compute=metrics_to_compute, code_for_loc=output_code)
            
             attempts.append({
                 "attempt": i + 1,
@@ -1277,12 +1477,19 @@ if st.button("Run Model", type="primary", disabled=(not models)):
                 if attempt_metrics:
                     st.markdown("**Metrics:**")
                     st.json(attempt_metrics)
+           
+            # Stop early when we get a pass (respecting max attempts)
+            if attempt_passed is True:
+                st.success(f"✅ Passed on attempt {i+1} — stopping early.")
+                break
        
         progress_bar.progress(1.0)
        
         # Compute pass@k using the proper formula
-        n = pass_at_k_value  # Total number of attempts
+        # n = actual attempts run (may be less than pass_at_k_value if we stopped early on pass)
+        n = len(attempts)
         c = len(passed_attempts)  # Number of correct attempts
+        k_eff = min(pass_at_k_value, n)  # Formula requires k <= n
         
         # Pass@1: just the first attempt
         pass_1 = 1 if attempts[0]["passed"] else (0 if attempts[0]["passed"] is False else None)
@@ -1293,11 +1500,11 @@ if st.button("Run Model", type="primary", disabled=(not models)):
         if all_none:
             pass_at_k = None
         else:
-            pass_at_k = estimate_pass_at_k(n=n, c=c, k=pass_at_k_value)
+            pass_at_k = estimate_pass_at_k(n=n, c=c, k=k_eff)
        
         # Display summary
         st.markdown("## 📊 Pass@k Results")
-        st.info(f"Using Pass@k formula: Pass@k = 1 - C(n-c, k) / C(n, k) where n={n}, c={c}, k={pass_at_k_value}")
+        st.info(f"Using Pass@k formula: Pass@k = 1 - C(n-c, k) / C(n, k) where n={n}, c={c}, k={k_eff} (max budget: {pass_at_k_value})")
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("Pass@1", f"{pass_1}" if pass_1 is not None else "N/A")
@@ -1326,13 +1533,92 @@ if st.button("Run Model", type="primary", disabled=(not models)):
                     "Attempt": attempt["attempt"],
                     "Passed": "✅" if attempt["passed"] else ("❌" if attempt["passed"] is False else "⚠️"),
                     "LOC": m.get("lines_of_code", "N/A"),
+                    "Comment count": m.get("comment_count", "N/A"),
                     "CC": m.get("cyclomatic_complexity", "N/A"),
                     "Cognitive": m.get("cognitive_complexity", "N/A"),
                     "Halstead": m.get("halstead_effort", "N/A"),
                 })
             metrics_df = pd.DataFrame(metrics_data)
             st.dataframe(metrics_df, use_container_width=True)
-       
+
+        # Same outputs as single run: Full Model Output, Generated vs Canonical, Code Metrics
+        st.markdown("## 🧠 Full Model Output")
+        st.caption("From Attempt 1 (same layout as single run)")
+        st.code(attempts[0]["output"], language="python")
+
+        col_gen, col_can = st.columns(2)
+        with col_gen:
+            st.markdown("### 🧩 Generated Code (Used for Analysis)")
+            st.code(attempts[0]["code"] or "# (no code extracted)", language="python")
+        with col_can:
+            st.markdown("### 📌 Canonical Solution")
+            canonical = task.get("canonical_solution")
+            if canonical:
+                st.code(canonical, language="python")
+            else:
+                st.info("No canonical solution available for this task.")
+        st.markdown("### 📜 Task Prompt")
+        st.code(task_prompt, language="python")
+
+        m = attempts[0].get("metrics") or {}
+        if m and not all(v is None for v in m.values()):
+            st.markdown("## 📊 Code Analysis Metrics")
+            st.caption("From Attempt 1")
+            c1, c2, c3, c4, c5 = st.columns(5)
+            with c1:
+                st.metric("Lines of Code", "N/A" if m.get("lines_of_code") is None else int(m["lines_of_code"]))
+            with c2:
+                st.metric("Comment count", "N/A" if m.get("comment_count") is None else int(m["comment_count"]))
+            with c3:
+                st.metric("Cyclomatic Complexity (CC)", "N/A" if m.get("cyclomatic_complexity") is None else round(float(m["cyclomatic_complexity"]), 4))
+            with c4:
+                st.metric("Cognitive Complexity", "N/A" if m.get("cognitive_complexity") is None else round(float(m["cognitive_complexity"]), 4))
+            with c5:
+                st.metric("Halstead Effort", "N/A" if m.get("halstead_effort") is None else round(float(m["halstead_effort"]), 4))
+            st.json({k: m.get(k) for k in ["lines_of_code", "comment_count", "cyclomatic_complexity", "cognitive_complexity", "halstead_effort"]})
+            df_metrics = pd.DataFrame([{
+                "lines_of_code": m.get("lines_of_code"),
+                "comment_count": m.get("comment_count"),
+                "cyclomatic_complexity": m.get("cyclomatic_complexity"),
+                "cognitive_complexity": m.get("cognitive_complexity"),
+                "halstead_effort": m.get("halstead_effort"),
+            }])
+            st.download_button("Download Metrics CSV (Attempt 1)", df_metrics.to_csv(index=False), "metrics_attempt1.csv", "text/csv", key="dl_metrics_passatk")
+        elif enable_metrics:
+            st.markdown("## 📊 Code Analysis Metrics")
+            st.info("No metrics computed for first attempt (missing deps, malformed code, or attempt did not pass).")
+
+        # Compute similarity for this run (so we can save it to Supabase)
+        similarity_score = None
+        if enable_similarity and enable_rag and reference_text.strip() and attempts[0]["code"].strip():
+            embedder = get_embedder()
+            if embedder and util_mod:
+                try:
+                    emb_out = embedder.encode(attempts[0]["code"], convert_to_tensor=True)
+                    emb_ref = embedder.encode(reference_text, convert_to_tensor=True)
+                    similarity_score = util_mod.pytorch_cos_sim(emb_out, emb_ref).item()
+                except Exception:
+                    pass
+
+        save_pass_at_k_run(
+            model_name=selected_model,
+            task_id=selected_task_id,
+            task_prompt=task_prompt,
+            canonical_solution=task.get("canonical_solution"),
+            use_humaneval=use_humaneval,
+            rag_enabled=enable_rag,
+            pass_1=pass_1,
+            pass_k=pass_at_k,
+            k=pass_at_k_value,
+            n_attempts=n,
+            c_passed=c,
+            attempts=attempts,
+            raw_output_attempt1=attempts[0]["output"],
+            extracted_code_attempt1=attempts[0]["code"],
+            metrics_attempt1=attempts[0].get("metrics") or {},
+            similarity_score=similarity_score,
+        )
+
         # Use first attempt for similarity/metrics display
         output_code = attempts[0]["code"]
         code_for_metrics = task_prompt + "\n" + output_code if output_code.strip() else ""
@@ -1397,16 +1683,16 @@ if st.button("Run Model", type="primary", disabled=(not models)):
 
 
         # ✅ Metrics
-        if enable_metrics and code_for_metrics.strip():
+        if enable_metrics and bool(metrics_to_compute) and code_for_metrics.strip():
             st.markdown("## 📊 Code Analysis Metrics")
-            m = analyze_code_metrics(code_for_metrics)
+            m = analyze_code_metrics(code_for_metrics, metrics_to_compute=metrics_to_compute, code_for_loc=output_code)
 
 
             # If everything is None, show the same helpful message you saw before
             if all(v is None for v in m.values()):
                 st.info("No metrics computed (missing deps or malformed code).")
             else:
-                c1, c2, c3, c4 = st.columns(4)
+                c1, c2, c3, c4, c5 = st.columns(5)
                 with c1:
                     st.metric(
                         "Lines of Code",
@@ -1414,26 +1700,32 @@ if st.button("Run Model", type="primary", disabled=(not models)):
                     )
                 with c2:
                     st.metric(
+                        "Comment count",
+                        "N/A" if m["comment_count"] is None else int(m["comment_count"]),
+                    )
+                with c3:
+                    st.metric(
                         "Cyclomatic Complexity (CC)",
                         "N/A" if m["cyclomatic_complexity"] is None else round(float(m["cyclomatic_complexity"]), 4),
                     )
-                with c3:
+                with c4:
                     st.metric(
                         "Cognitive Complexity",
                         "N/A" if m["cognitive_complexity"] is None else round(float(m["cognitive_complexity"]), 4),
                     )
-                with c4:
+                with c5:
                     st.metric(
                         "Halstead Effort",
                         "N/A" if m["halstead_effort"] is None else round(float(m["halstead_effort"]), 4),
                     )
 
 
-                st.json({k: m.get(k) for k in ["lines_of_code", "cyclomatic_complexity", "cognitive_complexity", "halstead_effort"]})
+                st.json({k: m.get(k) for k in ["lines_of_code", "comment_count", "cyclomatic_complexity", "cognitive_complexity", "halstead_effort"]})
 
 
                 df = pd.DataFrame([{
                     "lines_of_code": m.get("lines_of_code"),
+                    "comment_count": m.get("comment_count"),
                     "cyclomatic_complexity": m.get("cyclomatic_complexity"),
                     "cognitive_complexity": m.get("cognitive_complexity"),
                     "halstead_effort": m.get("halstead_effort"),
@@ -1561,12 +1853,14 @@ if batch_mode:
                 st.markdown("**Select which metrics to compute:**")
                 metric_label_to_key = {
                     "Lines of Code (LOC)": "lines_of_code",
+                    "Comment count": "comment_count",
                     "Cyclomatic Complexity (CC)": "cyclomatic_complexity",
                     "Cognitive Complexity": "cognitive_complexity",
                     "Halstead Effort": "halstead_effort",
                 }
                 default_metric_labels = [
                     "Lines of Code (LOC)",
+                    "Comment count",
                     "Cyclomatic Complexity (CC)",
                     "Cognitive Complexity",
                     "Halstead Effort",
