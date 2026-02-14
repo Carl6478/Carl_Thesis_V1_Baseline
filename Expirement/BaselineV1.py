@@ -593,6 +593,25 @@ def load_text_from_file(uploaded_file):
 
 
 # ---------------------------------------------------------
+#  Metrics helpers
+# ---------------------------------------------------------
+def extract_function_signature(prompt: str) -> str:
+    """
+    Extract just the function definition line (def ...:) from a HumanEval prompt.
+    Returns empty string if no function definition found.
+    """
+    if not prompt:
+        return ""
+    
+    for line in prompt.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("def "):
+            return line
+    
+    return ""
+
+
+# ---------------------------------------------------------
 #  Metrics (ONLY requested)
 # ---------------------------------------------------------
 def analyze_code_metrics(code: str, metrics_to_compute=None, code_for_loc=None):
@@ -613,6 +632,7 @@ def analyze_code_metrics(code: str, metrics_to_compute=None, code_for_loc=None):
       - Optional separate code string to use for LOC, comment count, and all complexity
         metrics (CC, cognitive, Halstead). If None, uses the main `code` parameter.
       - Use this so metrics reflect generated code only (e.g. exclude prompt stubs).
+      - Note: If code_for_loc is not syntactically valid, complexity metrics will return None.
     """
     result = {
         "lines_of_code": None,
@@ -629,7 +649,7 @@ def analyze_code_metrics(code: str, metrics_to_compute=None, code_for_loc=None):
     if not code or not code.strip():
         return result
 
-    # Use generated-code-only when provided (for LOC and all complexity metrics)
+    # Use code_for_loc when provided (for LOC and all complexity metrics)
     loc_code = code_for_loc if code_for_loc is not None else code
     complexity_code = code_for_loc if code_for_loc is not None else code
 
@@ -656,7 +676,7 @@ def analyze_code_metrics(code: str, metrics_to_compute=None, code_for_loc=None):
             result["comment_count"] = None
 
 
-    # Cyclomatic Complexity (Radon) — on generated code only when code_for_loc provided
+    # Cyclomatic Complexity (Radon) — uses code_for_loc when provided
     if (metrics_to_compute is None or "cyclomatic_complexity" in metrics_to_compute) and radon_cc:
         try:
             cc_blocks = radon_cc(complexity_code)
@@ -665,7 +685,7 @@ def analyze_code_metrics(code: str, metrics_to_compute=None, code_for_loc=None):
             result["cyclomatic_complexity"] = None
 
 
-    # Cognitive Complexity (requires AST + functions) — on generated code only when code_for_loc provided
+    # Cognitive Complexity (requires AST + functions) — uses code_for_loc when provided
     if metrics_to_compute is None or "cognitive_complexity" in metrics_to_compute:
         try:
             tree = ast.parse(complexity_code)
@@ -690,7 +710,7 @@ def analyze_code_metrics(code: str, metrics_to_compute=None, code_for_loc=None):
                 result["cognitive_complexity"] = None
 
 
-    # Halstead Effort (Radon) — on generated code only when code_for_loc provided
+    # Halstead Effort (Radon) — uses code_for_loc when provided
     if (metrics_to_compute is None or "halstead_effort" in metrics_to_compute) and radon_halstead:
         try:
             h = radon_halstead(complexity_code)
@@ -1186,8 +1206,30 @@ if page == "Results":
 
                             metrics_val = row.get("metrics")
                             if metrics_val:
-                                st.markdown("#### 📊 Metrics")
-                                st.json(metrics_val)
+                                # If metrics are nested as {"generated": {...}, "canonical": {...}},
+                                # show them side-by-side for easier comparison.
+                                if isinstance(metrics_val, dict) and (
+                                    "generated" in metrics_val or "canonical" in metrics_val
+                                ):
+                                    gen_metrics = metrics_val.get("generated")
+                                    can_metrics = metrics_val.get("canonical")
+
+                                    st.markdown("#### 📊 Metrics")
+                                    if gen_metrics or can_metrics:
+                                        col_m_gen, col_m_can = st.columns(2)
+                                        with col_m_gen:
+                                            st.markdown("**Generated solution**")
+                                            st.json(gen_metrics or {})
+                                        with col_m_can:
+                                            st.markdown("**Canonical solution**")
+                                            if can_metrics:
+                                                st.json(can_metrics)
+                                            else:
+                                                st.info("No canonical metrics stored for this row.")
+                                else:
+                                    # Backwards-compatible: show metrics dict as-is
+                                    st.markdown("#### 📊 Metrics")
+                                    st.json(metrics_val)
 
                         # Experiment logs: show prompt, extracted code, metrics
                         elif table == "experiment_logs":
@@ -1224,9 +1266,28 @@ if page == "Results":
                             if task_prompt_val:
                                 st.markdown("#### 📜 Task Prompt")
                                 st.code(task_prompt_val, language="python")
-                            if row.get("metrics"):
+                            metrics_val = row.get("metrics")
+                            if metrics_val:
                                 st.markdown("#### 📊 Code Metrics (Attempt 1)")
-                                st.json(row.get("metrics"))
+                                # Same nested structure as single_runs: {"generated": ..., "canonical": ...}
+                                if isinstance(metrics_val, dict) and (
+                                    "generated" in metrics_val or "canonical" in metrics_val
+                                ):
+                                    gen_metrics = metrics_val.get("generated")
+                                    can_metrics = metrics_val.get("canonical")
+                                    col_m_gen, col_m_can = st.columns(2)
+                                    with col_m_gen:
+                                        st.markdown("**Generated solution**")
+                                        st.json(gen_metrics or {})
+                                    with col_m_can:
+                                        st.markdown("**Canonical solution**")
+                                        if can_metrics:
+                                            st.json(can_metrics)
+                                        else:
+                                            st.info("No canonical metrics stored for this row.")
+                                else:
+                                    # Backwards-compatible: show metrics dict as-is
+                                    st.json(metrics_val)
                             st.markdown("#### 📐 Pass@k Summary")
                             st.json({
                                 "pass_1": row.get("pass_1"),
@@ -1560,33 +1621,90 @@ if st.button("Run Model", type="primary", disabled=(not models)):
         st.markdown("### 📜 Task Prompt")
         st.code(task_prompt, language="python")
 
-        m = attempts[0].get("metrics") or {}
-        if m and not all(v is None for v in m.values()):
+        # Metrics for attempt 1 + canonical (if available)
+        gen_m = attempts[0].get("metrics") or {}
+        canonical_m = None
+        canonical_code = task.get("canonical_solution")
+        if enable_metrics and canonical_code and bool(metrics_to_compute):
+            # Extract just the function signature (def line) from prompt
+            func_signature = extract_function_signature(task_prompt) if task_prompt else ""
+            # Combine signature with canonical solution body
+            canonical_code_for_metrics = func_signature + "\n" + canonical_code if func_signature else canonical_code
+            # Calculate all metrics on signature + body (minimal valid code)
+            canonical_m = analyze_code_metrics(
+                canonical_code_for_metrics,
+                metrics_to_compute=metrics_to_compute,
+            )
+
+        if enable_metrics:
             st.markdown("## 📊 Code Analysis Metrics")
             st.caption("From Attempt 1")
-            c1, c2, c3, c4, c5 = st.columns(5)
-            with c1:
-                st.metric("Lines of Code", "N/A" if m.get("lines_of_code") is None else int(m["lines_of_code"]))
-            with c2:
-                st.metric("Comment count", "N/A" if m.get("comment_count") is None else int(m["comment_count"]))
-            with c3:
-                st.metric("Cyclomatic Complexity (CC)", "N/A" if m.get("cyclomatic_complexity") is None else round(float(m["cyclomatic_complexity"]), 4))
-            with c4:
-                st.metric("Cognitive Complexity", "N/A" if m.get("cognitive_complexity") is None else round(float(m["cognitive_complexity"]), 4))
-            with c5:
-                st.metric("Halstead Effort", "N/A" if m.get("halstead_effort") is None else round(float(m["halstead_effort"]), 4))
-            st.json({k: m.get(k) for k in ["lines_of_code", "comment_count", "cyclomatic_complexity", "cognitive_complexity", "halstead_effort"]})
-            df_metrics = pd.DataFrame([{
-                "lines_of_code": m.get("lines_of_code"),
-                "comment_count": m.get("comment_count"),
-                "cyclomatic_complexity": m.get("cyclomatic_complexity"),
-                "cognitive_complexity": m.get("cognitive_complexity"),
-                "halstead_effort": m.get("halstead_effort"),
-            }])
-            st.download_button("Download Metrics CSV (Attempt 1)", df_metrics.to_csv(index=False), "metrics_attempt1.csv", "text/csv", key="dl_metrics_passatk")
-        elif enable_metrics:
-            st.markdown("## 📊 Code Analysis Metrics")
-            st.info("No metrics computed for first attempt (missing deps, malformed code, or attempt did not pass).")
+
+            if gen_m and not all(v is None for v in gen_m.values()):
+                # Layout: generated vs canonical side-by-side when canonical metrics exist
+                if canonical_m:
+                    col_gen_metrics, col_can_metrics = st.columns(2)
+                    gen_container = col_gen_metrics
+                    can_container = col_can_metrics
+                else:
+                    gen_container = st.container()
+                    can_container = None
+
+                # Generated metrics
+                with gen_container:
+                    st.markdown("### Generated Solution")
+                    c1, c2, c3, c4, c5 = st.columns(5)
+                    with c1:
+                        st.metric("Lines of Code", "N/A" if gen_m.get("lines_of_code") is None else int(gen_m["lines_of_code"]))
+                    with c2:
+                        st.metric("Comment count", "N/A" if gen_m.get("comment_count") is None else int(gen_m["comment_count"]))
+                    with c3:
+                        st.metric("Cyclomatic Complexity (CC)", "N/A" if gen_m.get("cyclomatic_complexity") is None else round(float(gen_m["cyclomatic_complexity"]), 4))
+                    with c4:
+                        st.metric("Cognitive Complexity", "N/A" if gen_m.get("cognitive_complexity") is None else round(float(gen_m["cognitive_complexity"]), 4))
+                    with c5:
+                        st.metric("Halstead Effort", "N/A" if gen_m.get("halstead_effort") is None else round(float(gen_m["halstead_effort"]), 4))
+                    st.json({k: gen_m.get(k) for k in ["lines_of_code", "comment_count", "cyclomatic_complexity", "cognitive_complexity", "halstead_effort"]})
+
+                # Canonical metrics (if available)
+                if canonical_m and can_container is not None:
+                    with can_container:
+                        st.markdown("### Canonical Solution")
+                        c1c, c2c, c3c, c4c, c5c = st.columns(5)
+                        with c1c:
+                            st.metric("Lines of Code", "N/A" if canonical_m.get("lines_of_code") is None else int(canonical_m["lines_of_code"]))
+                        with c2c:
+                            st.metric("Comment count", "N/A" if canonical_m.get("comment_count") is None else int(canonical_m["comment_count"]))
+                        with c3c:
+                            st.metric("Cyclomatic Complexity (CC)", "N/A" if canonical_m.get("cyclomatic_complexity") is None else round(float(canonical_m["cyclomatic_complexity"]), 4))
+                        with c4c:
+                            st.metric("Cognitive Complexity", "N/A" if canonical_m.get("cognitive_complexity") is None else round(float(canonical_m["cognitive_complexity"]), 4))
+                        with c5c:
+                            st.metric("Halstead Effort", "N/A" if canonical_m.get("halstead_effort") is None else round(float(canonical_m["halstead_effort"]), 4))
+                        st.json({k: canonical_m.get(k) for k in ["lines_of_code", "comment_count", "cyclomatic_complexity", "cognitive_complexity", "halstead_effort"]})
+
+                # Download CSV with generated + canonical metrics where available
+                rows_for_df = [{
+                    "variant": "generated",
+                    "lines_of_code": gen_m.get("lines_of_code"),
+                    "comment_count": gen_m.get("comment_count"),
+                    "cyclomatic_complexity": gen_m.get("cyclomatic_complexity"),
+                    "cognitive_complexity": gen_m.get("cognitive_complexity"),
+                    "halstead_effort": gen_m.get("halstead_effort"),
+                }]
+                if canonical_m:
+                    rows_for_df.append({
+                        "variant": "canonical",
+                        "lines_of_code": canonical_m.get("lines_of_code"),
+                        "comment_count": canonical_m.get("comment_count"),
+                        "cyclomatic_complexity": canonical_m.get("cyclomatic_complexity"),
+                        "cognitive_complexity": canonical_m.get("cognitive_complexity"),
+                        "halstead_effort": canonical_m.get("halstead_effort"),
+                    })
+                df_metrics = pd.DataFrame(rows_for_df)
+                st.download_button("Download Metrics CSV (Attempt 1)", df_metrics.to_csv(index=False), "metrics_attempt1.csv", "text/csv", key="dl_metrics_passatk")
+            else:
+                st.info("No metrics computed for first attempt (missing deps, malformed code, or attempt did not pass).")
 
         # Compute similarity for this run (so we can save it to Supabase)
         similarity_score = None
@@ -1615,7 +1733,14 @@ if st.button("Run Model", type="primary", disabled=(not models)):
             attempts=attempts,
             raw_output_attempt1=attempts[0]["output"],
             extracted_code_attempt1=attempts[0]["code"],
-            metrics_attempt1=attempts[0].get("metrics") or {},
+            metrics_attempt1=(
+                {
+                    "generated": gen_m,
+                    "canonical": canonical_m,
+                }
+                if canonical_m
+                else gen_m
+            ),
             similarity_score=similarity_score,
         )
 
@@ -1685,55 +1810,137 @@ if st.button("Run Model", type="primary", disabled=(not models)):
         # ✅ Metrics
         if enable_metrics and bool(metrics_to_compute) and code_for_metrics.strip():
             st.markdown("## 📊 Code Analysis Metrics")
-            m = analyze_code_metrics(code_for_metrics, metrics_to_compute=metrics_to_compute, code_for_loc=output_code)
+            # Metrics for generated solution
+            m = analyze_code_metrics(
+                code_for_metrics,
+                metrics_to_compute=metrics_to_compute,
+                code_for_loc=output_code,
+            )
 
+            # Metrics for canonical solution (when available in HumanEval single-run mode)
+            canonical_metrics = None
+            if use_humaneval and selected_task_id and task_meta:
+                canonical_code = task_meta.get("canonical_solution")
+                if canonical_code:
+                    prompt_for_task = task_meta.get("prompt")
+                    # Extract just the function signature (def line) from prompt
+                    func_signature = extract_function_signature(prompt_for_task) if prompt_for_task else ""
+                    # Combine signature with canonical solution body
+                    canonical_code_for_metrics = func_signature + "\n" + canonical_code if func_signature else canonical_code
+                    # Calculate all metrics on signature + body (minimal valid code)
+                    canonical_metrics = analyze_code_metrics(
+                        canonical_code_for_metrics,
+                        metrics_to_compute=metrics_to_compute,
+                    )
 
-            # If everything is None, show the same helpful message you saw before
+            # If everything is None for generated metrics, show the same helpful message you saw before
             if all(v is None for v in m.values()):
-                st.info("No metrics computed (missing deps or malformed code).")
+                st.info("No metrics computed for generated code (missing deps or malformed code).")
             else:
-                c1, c2, c3, c4, c5 = st.columns(5)
-                with c1:
-                    st.metric(
-                        "Lines of Code",
-                        "N/A" if m["lines_of_code"] is None else int(m["lines_of_code"]),
-                    )
-                with c2:
-                    st.metric(
-                        "Comment count",
-                        "N/A" if m["comment_count"] is None else int(m["comment_count"]),
-                    )
-                with c3:
-                    st.metric(
-                        "Cyclomatic Complexity (CC)",
-                        "N/A" if m["cyclomatic_complexity"] is None else round(float(m["cyclomatic_complexity"]), 4),
-                    )
-                with c4:
-                    st.metric(
-                        "Cognitive Complexity",
-                        "N/A" if m["cognitive_complexity"] is None else round(float(m["cognitive_complexity"]), 4),
-                    )
-                with c5:
-                    st.metric(
-                        "Halstead Effort",
-                        "N/A" if m["halstead_effort"] is None else round(float(m["halstead_effort"]), 4),
-                    )
+                # Choose containers for generated vs canonical metrics
+                if canonical_metrics:
+                    col_gen, col_can = st.columns(2)
+                    gen_container = col_gen
+                    can_container = col_can
+                else:
+                    gen_container = st.container()
+                    can_container = None
 
+                # Generated metrics (left column)
+                with gen_container:
+                    st.markdown("### Generated Solution")
+                    c1, c2, c3, c4, c5 = st.columns(5)
+                    with c1:
+                        st.metric(
+                            "Lines of Code",
+                            "N/A" if m["lines_of_code"] is None else int(m["lines_of_code"]),
+                        )
+                    with c2:
+                        st.metric(
+                            "Comment count",
+                            "N/A" if m["comment_count"] is None else int(m["comment_count"]),
+                        )
+                    with c3:
+                        st.metric(
+                            "Cyclomatic Complexity (CC)",
+                            "N/A" if m["cyclomatic_complexity"] is None else round(float(m["cyclomatic_complexity"]), 4),
+                        )
+                    with c4:
+                        st.metric(
+                            "Cognitive Complexity",
+                            "N/A" if m["cognitive_complexity"] is None else round(float(m["cognitive_complexity"]), 4),
+                        )
+                    with c5:
+                        st.metric(
+                            "Halstead Effort",
+                            "N/A" if m["halstead_effort"] is None else round(float(m["halstead_effort"]), 4),
+                        )
 
-                st.json({k: m.get(k) for k in ["lines_of_code", "comment_count", "cyclomatic_complexity", "cognitive_complexity", "halstead_effort"]})
+                    st.json({k: m.get(k) for k in ["lines_of_code", "comment_count", "cyclomatic_complexity", "cognitive_complexity", "halstead_effort"]})
 
+                # Canonical metrics (right column, only when available)
+                if canonical_metrics and can_container is not None:
+                    with can_container:
+                        st.markdown("### Canonical Solution")
+                        c1c, c2c, c3c, c4c, c5c = st.columns(5)
+                        with c1c:
+                            st.metric(
+                                "Lines of Code",
+                                "N/A" if canonical_metrics["lines_of_code"] is None else int(canonical_metrics["lines_of_code"]),
+                            )
+                        with c2c:
+                            st.metric(
+                                "Comment count",
+                                "N/A" if canonical_metrics["comment_count"] is None else int(canonical_metrics["comment_count"]),
+                            )
+                        with c3c:
+                            st.metric(
+                                "Cyclomatic Complexity (CC)",
+                                "N/A" if canonical_metrics["cyclomatic_complexity"] is None else round(float(canonical_metrics["cyclomatic_complexity"]), 4),
+                            )
+                        with c4c:
+                            st.metric(
+                                "Cognitive Complexity",
+                                "N/A" if canonical_metrics["cognitive_complexity"] is None else round(float(canonical_metrics["cognitive_complexity"]), 4),
+                            )
+                        with c5c:
+                            st.metric(
+                                "Halstead Effort",
+                                "N/A" if canonical_metrics["halstead_effort"] is None else round(float(canonical_metrics["halstead_effort"]), 4),
+                            )
 
-                df = pd.DataFrame([{
+                        st.json({k: canonical_metrics.get(k) for k in ["lines_of_code", "comment_count", "cyclomatic_complexity", "cognitive_complexity", "halstead_effort"]})
+
+                # Download CSV containing both generated and canonical metrics (when available)
+                rows_for_df = [{
+                    "variant": "generated",
                     "lines_of_code": m.get("lines_of_code"),
                     "comment_count": m.get("comment_count"),
                     "cyclomatic_complexity": m.get("cyclomatic_complexity"),
                     "cognitive_complexity": m.get("cognitive_complexity"),
                     "halstead_effort": m.get("halstead_effort"),
-                }])
+                }]
+                if canonical_metrics:
+                    rows_for_df.append({
+                        "variant": "canonical",
+                        "lines_of_code": canonical_metrics.get("lines_of_code"),
+                        "comment_count": canonical_metrics.get("comment_count"),
+                        "cyclomatic_complexity": canonical_metrics.get("cyclomatic_complexity"),
+                        "cognitive_complexity": canonical_metrics.get("cognitive_complexity"),
+                        "halstead_effort": canonical_metrics.get("halstead_effort"),
+                    })
+
+                df = pd.DataFrame(rows_for_df)
                 st.download_button("Download Metrics CSV", df.to_csv(index=False), "metrics.csv", "text/csv")
 
-
-            metrics = m
+            # For Supabase logging, store both generated and canonical metrics (when available)
+            if canonical_metrics:
+                metrics = {
+                    "generated": m,
+                    "canonical": canonical_metrics,
+                }
+            else:
+                metrics = m
         elif enable_metrics:
             st.warning("No code extracted — skipping code metrics.")
 
